@@ -1,24 +1,7 @@
 #!/usr/bin/env python3
 """
 run.py — Railway entrypoint wrapper for FastLoop Trader
-
-Responsibilities:
-  1. Run fastloop_trader.py as a subprocess
-  2. Parse its stdout for trade signals / errors
-  3. Send Telegram alerts accordingly
-  4. Exit with correct code so Railway marks the cron as pass/fail
-
-Environment variables required:
-  SIMMER_API_KEY          — from simmer.markets/dashboard
-  WALLET_PRIVATE_KEY      — Polymarket wallet private key (for --live)
-  TELEGRAM_BOT_TOKEN      — from @BotFather
-  TELEGRAM_CHAT_ID        — your chat/channel ID or @username
-
-Optional:
-  LIVE_TRADING=1          — set to enable --live flag (default: dry-run)
-  SMART_SIZING=1          — enable --smart-sizing
-  NOTIFY_SKIPS=1          — also send Telegram msg on skip (noisy, off by default)
-  DAILY_BUDGET_USD=20     — override daily budget (default 20)
+Produces clear, structured logs every cycle so you always know exactly what happened.
 """
 
 import os
@@ -27,114 +10,87 @@ import json
 import subprocess
 from datetime import datetime, timezone
 
-# Apply multi-source price fallback patch before subprocess launch
-# (patch also applies inside the subprocess via PYTHONPATH)
 try:
-    import price_fallback  # noqa — patches fastloop_trader.get_momentum at import
+    import price_fallback  # noqa
 except Exception as e:
     print(f"⚠️  price_fallback import warning: {e}", flush=True)
 
-from telegram_notify import (
-    send,
-    notify_trade,
-    notify_error,
-    notify_skip,
-    notify_startup,
-    notify_budget_warning,
-)
+from telegram_notify import notify_trade, notify_error, notify_skip, notify_budget_warning
 
-# ── Config ────────────────────────────────────────────────────────────────────
-LIVE_TRADING   = os.environ.get("LIVE_TRADING", "0") == "1"
-SMART_SIZING   = os.environ.get("SMART_SIZING", "0") == "1"
-DAILY_BUDGET   = float(os.environ.get("DAILY_BUDGET_USD", "20"))
-ASSET          = os.environ.get("SIMMER_SPRINT_ASSET", "BTC")
+# ── Config ─────────────────────────────────────────────────────────────────────
+LIVE_TRADING  = os.environ.get("LIVE_TRADING", "0") == "1"
+SMART_SIZING  = os.environ.get("SMART_SIZING", "0") == "1"
+DAILY_BUDGET  = float(os.environ.get("DAILY_BUDGET_USD", "20"))
+ASSET         = os.environ.get("SIMMER_SPRINT_ASSET", "BTC")
+WINDOW        = os.environ.get("SIMMER_SPRINT_WINDOW", "5m")
+ENTRY_THRESH  = os.environ.get("SIMMER_FASTLOOP_ENTRY_THRESHOLD", "0.05")
+MOMENTUM_MIN  = os.environ.get("SIMMER_FASTLOOP_MOMENTUM_THRESHOLD", "0.5")
+MAX_POS       = os.environ.get("SIMMER_FASTLOOP_MAX_POSITION_USD", "5")
 
-# ── Force AUTOMATON_MANAGED so SDK always emits structured JSON reports ──────
-# Without this the SDK detects Railway's environment inconsistently and
-# sometimes exits silently with zero output, making failures invisible.
-os.environ.setdefault("AUTOMATON_MANAGED", "1")
+os.environ["AUTOMATON_MANAGED"] = "1"
 
-# ── Force structured JSON output from Simmer SDK ─────────────────────────────
-os.environ.setdefault("AUTOMATON_MANAGED", "1")
+# ── Header ─────────────────────────────────────────────────────────────────────
+ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+mode_label = "LIVE" if LIVE_TRADING else "DRY RUN"
 
-# ── Build CLI command ─────────────────────────────────────────────────────────
-cmd = [sys.executable, "-c",
-       "import price_fallback; import runpy; runpy.run_path('fastloop_trader.py', run_name='__main__')",
-]
-# Append flags via sys.argv trick — simpler: use wrapper args approach
-cmd = [sys.executable, "fastloop_trader.py", "--quiet"]
+print("", flush=True)
+print("=" * 60, flush=True)
+print(f"  FASTLOOP  |  {ts}  |  {mode_label}", flush=True)
+print("=" * 60, flush=True)
+print(f"  Asset: {ASSET}  Window: {WINDOW}  Budget: ${DAILY_BUDGET}", flush=True)
+print(f"  Entry: {ENTRY_THRESH}  Momentum min: {MOMENTUM_MIN}%  Max pos: ${MAX_POS}", flush=True)
+print("-" * 60, flush=True)
+
+# ── Build subprocess command ───────────────────────────────────────────────────
+# NOTE: No --quiet flag — we want full diagnostic output visible in Railway logs
+cmd = [sys.executable, "fastloop_trader.py"]
 if LIVE_TRADING:
     cmd.append("--live")
 if SMART_SIZING:
     cmd.append("--smart-sizing")
 
-# Ensure price_fallback is importable inside the subprocess
 _here = os.path.dirname(os.path.abspath(__file__))
-_env = os.environ.copy()
+_env  = os.environ.copy()
 _env["PYTHONPATH"] = _here + (":" + _env["PYTHONPATH"] if _env.get("PYTHONPATH") else "")
-# Activate patch inside subprocess via sitecustomize trick
 _env["PYTHONSTARTUP"] = os.path.join(_here, "price_fallback.py")
 
-mode_label = "LIVE" if LIVE_TRADING else "DRY RUN"
-ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-print(f"[{ts}] ⚡ FastLoop cycle starting ({mode_label})", flush=True)
-
-# ── Notify Telegram: cycle start (quiet — skip in non-live to reduce noise) ──
-if LIVE_TRADING:
-    notify_startup(mode_label, ASSET, DAILY_BUDGET)
-
-# ── Run trader ────────────────────────────────────────────────────────────────
+# ── Run trader ─────────────────────────────────────────────────────────────────
 try:
-    result = subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
-        timeout=90,  # 5-min cron, give plenty of headroom
-        env=_env,
-    )
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=90, env=_env)
 except subprocess.TimeoutExpired:
-    msg = "FastLoop timed out after 90s"
-    print(f"❌ {msg}", flush=True)
-    notify_error(msg)
+    print("RESULT: TIMEOUT — FastLoop took >90s", flush=True)
+    notify_error("FastLoop timed out after 90s on Railway")
     sys.exit(1)
 
 stdout = result.stdout or ""
 stderr = result.stderr or ""
 
-# Always print full output to Railway logs
+# Print full trader output — always visible in Railway logs
 print(stdout, flush=True)
-if stderr:
-    print(f"[stderr]\n{stderr}", flush=True)
+if stderr.strip():
+    print(f"[STDERR]\n{stderr}", flush=True)
 
-# ── Parse automaton JSON report ───────────────────────────────────────────────
+# ── Parse automaton JSON ───────────────────────────────────────────────────────
 automaton_data = None
 for line in stdout.splitlines():
-    line = line.strip()
-    if line.startswith('{"automaton"'):
+    if line.strip().startswith('{"automaton"'):
         try:
-            automaton_data = json.loads(line).get("automaton", {})
+            automaton_data = json.loads(line.strip()).get("automaton", {})
         except json.JSONDecodeError:
             pass
 
-# ── Parse human-readable output for Telegram context ─────────────────────────
-def _extract(keyword, lines):
-    for l in lines:
-        if keyword.lower() in l.lower():
-            return l.strip()
-    return ""
-
-lines = stdout.splitlines()
-market_line  = _extract("Selected:", lines) or _extract("Sprint:", lines)
-signal_line  = _extract("Signal:", lines)
+# ── Extract context values from output ────────────────────────────────────────
+lines        = stdout.splitlines()
 momentum_val = 0.0
 price_val    = 0.0
 side_val     = "YES"
+price_source = "binance"
+market_name  = ""
 
-feed_source = "binance"
 for l in lines:
     if "Momentum:" in l:
         try:
-            momentum_val = float(l.split("Momentum:")[1].strip().split("%")[0].replace("+", ""))
+            momentum_val = float(l.split("Momentum:")[1].strip().split("%")[0].replace("+",""))
         except Exception:
             pass
     if "YES price:" in l or "YES $" in l:
@@ -142,83 +98,102 @@ for l in lines:
             price_val = float(l.split("$")[1].strip().split()[0])
         except Exception:
             pass
-    if "Signal: YES" in l or "Action: YES" in l:
-        side_val = "YES"
-    elif "Signal: NO" in l or "Action: NO" in l:
-        side_val = "NO"
-    if "Using Kraken" in l:
-        feed_source = "kraken"
-    elif "Using CoinGecko" in l:
-        feed_source = "coingecko"
-    elif "Failed to fetch price data" in l:
-        feed_source = "none"
+    if "Signal: YES" in l: side_val = "YES"
+    elif "Signal: NO" in l: side_val = "NO"
+    if "Price source:" in l:
+        try: price_source = l.split("Price source:")[1].strip().split()[0]
+        except Exception: pass
+    if "Selected:" in l:
+        market_name = l.replace("Selected:", "").replace("🎯", "").strip()
 
-market_name = market_line.replace("🎯 Selected:", "").replace("Sprint:", "").strip()
+# ── Results summary ────────────────────────────────────────────────────────────
+print("-" * 60, flush=True)
 
-# ── Handle results ────────────────────────────────────────────────────────────
 if result.returncode != 0:
-    err_snippet = (stderr or stdout)[:300]
-    print(f"❌ Trader exited with code {result.returncode}", flush=True)
-    notify_error(f"Exit code {result.returncode}\n{err_snippet}")
+    err = (stderr or stdout)[:300]
+    print(f"RESULT: CRASH  exit={result.returncode}", flush=True)
+    print(f"  {err[:200]}", flush=True)
+    notify_error(f"Trader crashed (exit {result.returncode})\n{err}")
+    print("=" * 60, flush=True)
     sys.exit(result.returncode)
 
 if automaton_data:
-    trades_executed = automaton_data.get("trades_executed", 0)
+    trades_executed  = automaton_data.get("trades_executed", 0)
     trades_attempted = automaton_data.get("trades_attempted", 0)
-    amount_usd = automaton_data.get("amount_usd", 0.0)
-    skip_reason = automaton_data.get("skip_reason", "")
-    exec_errors = automaton_data.get("execution_errors", [])
+    amount_usd       = automaton_data.get("amount_usd", 0.0)
+    skip_reason      = automaton_data.get("skip_reason", "")
+    signals          = automaton_data.get("signals", 0)
+    exec_errors      = automaton_data.get("execution_errors", [])
 
     if trades_executed > 0:
-        # 🎉 Trade fired — alert always
-        notify_trade(
-            side=side_val,
-            market=market_name or "BTC Fast Market",
-            amount=amount_usd,
-            price=price_val,
-            momentum=momentum_val,
-            dry_run=not LIVE_TRADING,
-        )
-        print(f"✅ Telegram: trade alert sent", flush=True)
-
-        # Budget warning: >80% consumed
-        spent_today = amount_usd  # conservative — actual total is in daily_spend.json
-        if spent_today / DAILY_BUDGET > 0.8:
-            notify_budget_warning(spent_today, DAILY_BUDGET)
+        print(f"RESULT: TRADE EXECUTED ({'PAPER' if not LIVE_TRADING else 'LIVE'})", flush=True)
+        print(f"  Side: {side_val}  Amount: ${amount_usd:.2f}  Price: ${price_val:.3f}", flush=True)
+        print(f"  Market: {market_name[:55]}", flush=True)
+        print(f"  Momentum: {momentum_val:+.3f}%  Feed: {price_source}", flush=True)
+        notify_trade(side=side_val, market=market_name or "BTC Fast Market",
+                     amount=amount_usd, price=price_val, momentum=momentum_val,
+                     dry_run=not LIVE_TRADING)
+        print(f"  Telegram alert: sent", flush=True)
+        if DAILY_BUDGET > 0 and amount_usd / DAILY_BUDGET > 0.8:
+            notify_budget_warning(amount_usd, DAILY_BUDGET)
 
     elif trades_attempted > 0 and exec_errors:
-        # Trade was attempted but failed
-        notify_error(f"Trade attempted but failed:\n" + "\n".join(exec_errors))
-        print(f"⚠️ Telegram: execution error alert sent", flush=True)
-
-    elif skip_reason:
-        notify_skip(skip_reason)
-        print(f"⏸ Skip: {skip_reason}", flush=True)
+        print(f"RESULT: TRADE FAILED (attempted, not executed)", flush=True)
+        for e in exec_errors:
+            print(f"  Error: {e}", flush=True)
+        notify_error("Trade attempted but failed:\n" + "\n".join(exec_errors))
 
     else:
-        # No signal
-        print(f"💤 No signal this cycle", flush=True)
+        low = stdout.lower()
+        if "no active fast markets" in low or "found 0 active" in low:
+            why = "NO MARKETS — No BTC fast markets live right now (check Polymarket directly)"
+        elif "no fast markets with" in low or "no tradeable markets" in low:
+            why = "NO MARKETS — All found markets too close to expiry or not yet live"
+        elif "momentum" in low and "< minimum" in low:
+            # Try to extract actual momentum value from output
+            actual = "unknown"
+            for l in lines:
+                if "Momentum" in l and "< minimum" in l:
+                    try: actual = l.strip()
+                    except Exception: pass
+            why = f"WEAK SIGNAL — {actual or 'BTC momentum below threshold of ' + MOMENTUM_MIN + '%'}"
+        elif "divergence" in low and "minimum" in low:
+            why = f"WEAK SIGNAL — Price divergence < entry threshold {ENTRY_THRESH}"
+        elif "already holding" in low:
+            why = "SKIPPED — Already holding a position on this market"
+        elif "wide spread" in low:
+            why = "SKIPPED — Order book spread too wide (illiquid)"
+        elif "fees eat" in low:
+            why = "SKIPPED — Edge too small to cover fees"
+        elif "daily budget" in low and "exhausted" in low:
+            why = f"BUDGET — Daily limit of ${DAILY_BUDGET} reached"
+        elif "all price sources failed" in low or "failed to fetch price" in low:
+            why = "PRICE FEED ERROR — All sources failed (Binance/OKX/Kraken/Bybit)"
+            notify_error(why)
+        elif "clob price unavailable" in low:
+            why = "PRICE FEED ERROR — Could not fetch live Polymarket CLOB price"
+        else:
+            why = f"NO SIGNAL — skip_reason={skip_reason or 'none'}"
+
+        print(f"RESULT: NO TRADE — {why}", flush=True)
+        if os.environ.get("NOTIFY_SKIPS") == "1":
+            notify_skip(why)
 
 else:
-    # No automaton JSON — parse output for diagnostic info
+    # No automaton JSON — early exit or crash before SDK reporting
     low = stdout.lower()
-    if "failed to fetch price data" in low:
-        notify_error("All price feeds failed (Binance + Kraken + CoinGecko). Check network.")
-        print("❌ Telegram: price feed failure alert sent", flush=True)
-    elif "no active fast markets" in low:
-        print("💤 No markets available this cycle (off-hours or wrong window)", flush=True)
-    elif "no tradeable markets" in low or "no live tradeable" in low:
-        print("💤 Markets found but none live/within time window", flush=True)
-    elif "already holding" in low:
-        print("💤 Skipped — already holding a position on this market", flush=True)
-    elif "error" in low or "failed" in low:
-        notify_error(f"Unexpected error:\n{stdout[-400:]}")
-        print("⚠️ Telegram: error alert sent", flush=True)
-    elif stdout.strip() == "":
-        # Completely blank output = SDK exited silently (automaton env detection issue)
-        print("⚠️  Empty output — SDK may have exited silently. Check SIMMER_API_KEY is set correctly.", flush=True)
+    if not stdout.strip():
+        msg = "EMPTY OUTPUT — SDK silent exit. Likely SIMMER_API_KEY invalid or simmer-sdk not installed."
+        print(f"RESULT: ERROR — {msg}", flush=True)
+        notify_error(msg)
+    elif "api key" in low or "simmer_api_key" in low:
+        msg = "API KEY ERROR — check SIMMER_API_KEY in Railway Variables"
+        print(f"RESULT: ERROR — {msg}", flush=True)
+        notify_error(msg)
     else:
-        print(f"💤 Cycle complete — no trade signal", flush=True)
+        print(f"RESULT: UNKNOWN — no structured report. See full output above.", flush=True)
 
-print(f"[{ts}] ✅ FastLoop cycle complete", flush=True)
+print("=" * 60, flush=True)
+print(f"  Cycle done  |  {ts}", flush=True)
+print("", flush=True)
 sys.exit(0)
